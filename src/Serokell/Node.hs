@@ -36,4 +36,4 @@ data NodeEnvironment = NodeEnvironment
     }
 
 -- Mutable part of the node state
-data NodeStorage = NodeStorage { nodeStorageTxs :: SetTx }
+data NodeStorage = NodeStorage { nodeStorageTxs :: Set Tx }
