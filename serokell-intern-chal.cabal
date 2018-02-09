@@ -33,6 +33,7 @@ library
     , binary
     , bytestring
     , containers
+    , ed25519
     , filepath
     , network
     , text
@@ -43,6 +44,8 @@ library
   other-modules:
       Paths_serokell_intern_chal
   default-language: Haskell2010
+  default-extensions: OverloadedStrings
+                      RecordWildCards
 
 executable serokell-intern-chal-exe
   main-is: Main.hs
@@ -55,6 +58,8 @@ executable serokell-intern-chal-exe
   other-modules:
       Paths_serokell_intern_chal
   default-language: Haskell2010
+  default-extensions: OverloadedStrings
+                      RecordWildCards
 
 test-suite serokell-intern-chal-test
   type: exitcode-stdio-1.0
