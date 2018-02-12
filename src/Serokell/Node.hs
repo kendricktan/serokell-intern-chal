@@ -6,9 +6,9 @@ module Serokell.Node where
 
 import           Control.Concurrent          (forkIO)
 import           Control.Monad               (void)
-import           Control.Monad.Reader        (ReaderT, runReaderT)
+import           Control.Monad.Reader        (ReaderT, ask, runReaderT)
 import           Control.Monad.State         (StateT, get, put, runStateT)
-import           Control.Monad.Trans         (lift)
+import           Control.Monad.Trans         (lift, liftIO)
 import           Control.Monad.Trans.Except  (ExceptT, runExceptT)
 import           Data.Either                 (Either, either)
 import           Data.Semigroup              ((<>))
@@ -27,8 +27,8 @@ import qualified Data.ByteString             as BString
 import qualified Data.ByteString.Base16      as B16
 import qualified Data.ByteString.Base16.Lazy as B16L
 import qualified Data.ByteString.Char8       as C8
+import qualified Data.ByteString.Lazy        as LBString
 import qualified Data.HashMap                as HM
-import qualified Data.Set                    as Set
 import qualified Data.Text                   as Text
 import qualified Data.Text.IO                as TextIO
 
@@ -80,8 +80,7 @@ data NodeEnvironment = NodeEnvironment
     }
 
 -- Cache State (Keeping track of all the UTXOs)
-data TxState = TxState { txs   :: Set.Set Tx
-                       , txsm  :: HM.Map Hash Tx
+data TxState = TxState { txs   :: [Tx]
                        , utxos :: HM.Map Address Natural
                        } deriving Show
 
@@ -121,7 +120,18 @@ getTxHashBString :: Tx -> BString.ByteString
 getTxHashBString (Tx _ _ f t a) = SHA256.hash $ C8.pack $ concat $ show <$> [f, t, show a]
 
 getTxHash :: Tx -> Hash
-getTxHash = C8.unpack . getTxHashBString
+getTxHash = b16e . getTxHashBString
+
+getUtxo :: Address -> TxState -> Natural
+getUtxo pubkey txstate = case HM.lookup pubkey (utxos txstate) of
+                       Nothing -> 0
+                       Just x  -> x
+
+getTxNo :: Int -> [Tx] -> Maybe Tx
+getTxNo _ []          = Nothing
+getTxNo i x@(xh : xt) = if length x == i
+                           then Just xh
+                           else getTxNo i xt
 
 -- Sign a tx
 signTx :: Tx -> ECC.SecretKey -> String
@@ -132,32 +142,70 @@ signTx tx sk = b16e $ ECC.sign sk (getTxHashBString tx)
 verifyTx :: Tx -> TxState -> Bool
 verifyTx tx txstate = case HM.lookup (txFrom tx) (utxos txstate) of
                         Nothing -> False
-                        Just x  -> case x < (txAmount tx) of
-                                     False -> False
-                                     True  -> ECC.verify (b16dpk (txFrom tx)) (getTxHashBString tx)
+                        Just x  -> (x >= txAmount tx) && ECC.verify (b16dpk (txFrom tx)) (getTxHashBString tx)
 
 createTx :: String -> String -> String -> Tx
-createTx sk txto amnt = Tx txhash txsig txfr txto (read amnt :: Natural)
-    where txfr = getSKAddress (b16dsk sk)
-          txtmp = Tx "" "" txfr txto (read amnt :: Natural)
+createTx sk txto amnt = Tx txhash txsig txfr txto txamnt
+    where txamnt = read amnt :: Natural
+          txfr = getSKAddress (b16dsk sk)
+          txtmp = Tx "" "" txfr txto txamnt
           txhash = getTxHash txtmp
           txsig = signTx txtmp (b16dsk sk)
+
+submitTx :: Tx -> TxMonad ()
+submitTx tx = do
+    txstate0 <- lift2 get
+    let txs1 = tx : txs txstate0
+    -- Calculate new utxo values
+    let txfromutxo = getUtxo (txFrom tx) txstate0 - txAmount tx
+    let txtoutxo = getUtxo (txTo tx) txstate0 + txAmount tx
+    -- Update
+    let utxos1 = HM.insert (txFrom tx) txfromutxo (utxos txstate0)
+    let utxos2 = HM.insert (txTo tx) txtoutxo utxos1
+    put (TxState txs1 utxos2)
 
 -- Lens maybe?
 lift2 a = lift $ lift a
 lift3 a = lift $ lift $ lift a
 
 -- Runs client
-runNode :: TxAction e s ()
-runNode = undefined
+runClientNode :: TxMonad ()
+runClientNode = do
+    env <- lift ask
+    txstate0 <- lift2 get
+    lift3 $ connectToUnixSocket "sockets" (nodeEnvId env) (clientHandler env txstate0)
 
-nodeHandler :: Conversation -> TxMonad void
-nodeHandler c = do
-    input <- lift3 TextIO.getLine
-    case Text.words input of
-      ("SUBMIT" : privKey : pubKey : amnt) -> undefined
-      ("QUERY": txhash)                    -> undefined
-      ("BALANCE": pubKey)                  -> undefined
-      _                                    -> do
-          lift3 $ hPrint stderr $ "Invalid command: " <> input
-          nodeHandler c
+clientHandler :: NodeEnvironment -> TxState -> Conversation -> IO ()
+clientHandler r s c = void $ runTxAction loop r s
+    where loop :: TxMonad void
+          loop = do
+            input <- lift3 TextIO.getLine
+            case Text.unpack <$> Text.words input of
+              ("SUBMIT" : sk : pk : amnt : _) -> do
+                  let tx = createTx sk pk amnt
+                  txstate0 <- lift2 get
+                  if verifyTx tx txstate0
+                    then do
+                        submitTx tx
+                        lift3 $ void . forkIO $ do
+                        send c $ LBString.toStrict $ Binary.encode tx
+                        (r :: Int) <- Binary.decode . LBString.fromStrict <$> recv c
+                        putStrLn $ "Tx sent, request id " <> show r
+                    else lift3 $ hPutStrLn stderr "0"
+                  loop
+
+              ("QUERY": txno : _)   -> do
+                  txstate0 <- lift2 get
+                  case getTxNo (read txno :: Int) (txs txstate0) of
+                    Just x -> lift3 $ putStrLn $ "1 " <> txHash x
+                    Nothing -> lift3 $ putStrLn "0"
+                  loop
+
+              ("BALANCE": pubkey : _) -> do
+                  txstate0 <- lift2 get
+                  lift3 $ putStrLn $ show $ getUtxo pubkey txstate0
+                  loop
+
+              _                   -> do
+                  lift3 $ hPrint stderr $ "Invalid command: " <> input
+                  loop
