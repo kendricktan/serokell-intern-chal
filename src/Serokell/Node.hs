@@ -11,6 +11,8 @@ import           Control.Monad.State         (StateT, get, put, runStateT)
 import           Control.Monad.Trans         (lift, liftIO)
 import           Control.Monad.Trans.Except  (ExceptT, runExceptT)
 import           Data.Either                 (Either, either)
+import           Data.IORef                  (IORef, modifyIORef, newIORef,
+                                              readIORef)
 import           Data.Semigroup              ((<>))
 import           GHC.Generics                (Generic)
 import           Numeric.Natural             (Natural)
@@ -74,9 +76,8 @@ instance Aeson.FromJSON Tx
 
 -- Node Environment, Immutable
 data NodeEnvironment = NodeEnvironment
-    { nodeEnvId     :: NodeId
-    , nodeEnvSecKey :: ECC.SecretKey
-    , nodeEnvPubKey :: ECC.PublicKey
+    { nodeEnvId        :: NodeId
+    , nodeSocketFolder :: String
     }
 
 -- Cache State (Keeping track of all the UTXOs)
@@ -124,8 +125,8 @@ getTxHash = b16e . getTxHashBString
 
 getUtxo :: Address -> TxState -> Natural
 getUtxo pubkey txstate = case HM.lookup pubkey (utxos txstate) of
-                       Nothing -> 0
-                       Just x  -> x
+                           Nothing -> 0
+                           Just x  -> x
 
 getTxNo :: Int -> [Tx] -> Maybe Tx
 getTxNo _ []          = Nothing
@@ -156,10 +157,10 @@ submitTx :: Tx -> TxMonad ()
 submitTx tx = do
     txstate0 <- lift2 get
     let txs1 = tx : txs txstate0
-    -- Calculate new utxo values
+        -- Calculate new utxo values
     let txfromutxo = getUtxo (txFrom tx) txstate0 - txAmount tx
     let txtoutxo = getUtxo (txTo tx) txstate0 + txAmount tx
-    -- Update
+        -- Update
     let utxos1 = HM.insert (txFrom tx) txfromutxo (utxos txstate0)
     let utxos2 = HM.insert (txTo tx) txtoutxo utxos1
     put (TxState txs1 utxos2)
@@ -173,7 +174,7 @@ runClientNode :: TxMonad ()
 runClientNode = do
     env <- lift ask
     txstate0 <- lift2 get
-    lift3 $ connectToUnixSocket "sockets" (nodeEnvId env) (clientHandler env txstate0)
+    lift3 $ connectToUnixSocket (nodeSocketFolder env) (nodeEnvId env) (clientHandler env txstate0)
 
 clientHandler :: NodeEnvironment -> TxState -> Conversation -> IO ()
 clientHandler r s c = void $ runTxAction loop r s
@@ -185,19 +186,19 @@ clientHandler r s c = void $ runTxAction loop r s
                   let tx = createTx sk pk amnt
                   txstate0 <- lift2 get
                   if verifyTx tx txstate0
-                    then do
+                     then do
                         submitTx tx
                         lift3 $ void . forkIO $ do
-                        send c $ LBString.toStrict $ Binary.encode tx
-                        (r :: Int) <- Binary.decode . LBString.fromStrict <$> recv c
-                        putStrLn $ "Tx sent, request id " <> show r
+                            send c $ LBString.toStrict $ Binary.encode tx
+                            (r :: Int) <- Binary.decode . LBString.fromStrict <$> recv c
+                            putStrLn $ "Tx sent, request id " <> show r
                     else lift3 $ hPutStrLn stderr "0"
                   loop
 
               ("QUERY": txno : _)   -> do
                   txstate0 <- lift2 get
                   case getTxNo (read txno :: Int) (txs txstate0) of
-                    Just x -> lift3 $ putStrLn $ "1 " <> txHash x
+                    Just x  -> lift3 $ putStrLn $ "1 " <> txHash x
                     Nothing -> lift3 $ putStrLn "0"
                   loop
 
@@ -209,3 +210,23 @@ clientHandler r s c = void $ runTxAction loop r s
               _                   -> do
                   lift3 $ hPrint stderr $ "Invalid command: " <> input
                   loop
+
+
+runServerNode :: TxMonad ()
+runServerNode = do
+    ref <- lift3 $ newIORef 0
+    env <- lift ask
+    txstate <- lift2 get
+    lift3 $ listenUnixSocket (nodeSocketFolder env) (nodeEnvId env) ((True <$) . forkIO . serverHandler env txstate ref)
+
+serverHandler :: NodeEnvironment -> TxState -> IORef Int -> Conversation -> IO ()
+serverHandler env txstate ref c = void $ runTxAction loop env txstate
+    where loop :: TxMonad void
+          loop = do
+              input <- lift3 $ recv c
+              counter <- lift3 $ readIORef ref
+              lift3 $ putStrLn $ "Request id: " <> show counter
+              lift3 $ modifyIORef ref (+1)
+              let tx = Binary.decode (LBString.fromStrict input) :: Tx
+              lift3 $ send c (LBString.toStrict $ Binary.encode input)
+              loop
