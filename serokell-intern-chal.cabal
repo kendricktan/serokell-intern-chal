@@ -29,15 +29,21 @@ library
   hs-source-dirs:
       src
   build-depends:
-      base >=4.7 && <5
+      aeson
+    , base >=4.7 && <5
     , binary
     , bytestring
     , containers
+    , cryptohash
     , ed25519
     , filepath
+    , hashmap
+    , mtl
     , network
-    , text
     , safe-exceptions
+    , text
+    , transformers
+    , utf8-string
   exposed-modules:
       Serokell.Communication.IPC
       Serokell.Node

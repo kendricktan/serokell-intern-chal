@@ -1,3 +1,4 @@
+{-# LANGUAGE DeriveGeneric              #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE TupleSections              #-}
 
@@ -18,6 +19,7 @@ import           Control.Exception.Safe    (bracket, bracket_)
 import           Control.Monad             (when)
 import           Data.Binary               (Binary)
 import           Data.ByteString           (ByteString)
+import           GHC.Generics              (Generic)
 import           System.Environment        (lookupEnv)
 import           System.FilePath           ((<.>), (</>))
 import           System.IO.Unsafe          (unsafePerformIO)
@@ -31,7 +33,7 @@ type SocketDirectory = FilePath
 
 -- | Id of node.
 newtype NodeId = NodeId { unNodeId :: Int }
-    deriving (Eq, Ord, Binary)
+    deriving (Eq, Ord, Binary, Generic, Show)
 
 type Send = ByteString -> IO ()
 type Recv = IO ByteString
