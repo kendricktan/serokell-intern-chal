@@ -88,6 +88,7 @@ data NodeEnvironment = NodeEnvironment
 
 -- TxState (keep track of the transactions and connected nodes)
 data TxState = TxState { txs   :: [Tx]
+                       , txshm :: HM.Map Hash Tx
                        , utxos :: HM.Map Address Natural
                        } deriving Show
 
@@ -159,28 +160,46 @@ createTx sk txto amnt = Tx txhash txsig txfr txto txamnt
           txhash = getTxHash txtmp
           txsig = signTx txtmp (b16dsk sk)
 
-submitTx :: Tx -> TxMonad ()
-submitTx tx = do
+applyTx :: Tx -> TxMonad ()
+applyTx tx = do
     txstate0 <- lift2 get
     let txs1 = tx : txs txstate0
-        -- Calculate new utxo values
+     -- Calculate new utxo values
     let txfromutxo = getUtxo (txFrom tx) txstate0 - txAmount tx
     let txtoutxo = getUtxo (txTo tx) txstate0 + txAmount tx
-        -- Update
+    -- Update local state
+    let txshm1 = HM.insert (txHash tx) tx (txshm txstate0)
     let utxos1 = HM.insert (txFrom tx) txfromutxo (utxos txstate0)
     let utxos2 = HM.insert (txTo tx) txtoutxo utxos1
-    put (TxState txs1 utxos2)
+    put (TxState txs1 txshm1 utxos2)
+
+memberTx :: Hash -> TxState -> Maybe Tx
+memberTx h txstate0 = HM.lookup h (txshm txstate0)
+
+broadcastTx :: Tx -> TxMonad ()
+broadcastTx tx = do
+    env <- lift ask
+    let maxNode = nodeCount env
+    let curNode = unNodeId $ nodeEnvId env
+    let txbinary = Binary.encode tx
+    let cmd = LC8.pack "SUBMIT " <> txbinary
+    lift3 $ void $ sequence $ (broadcastSocket cmd (nodeSocketFolder env)) <$> (filter ((/=) curNode) [1..maxNode])
+
+broadcastSocket :: LBString.ByteString -> String -> Int -> IO ()
+broadcastSocket bs f i = connectToUnixSocket f (NodeId i) bHandler
+    where bHandler :: Conversation -> IO ()
+          bHandler c = void . forkIO $ send c $ LBString.toStrict $ bs
 
 -- Lens maybe?
 lift2 a = lift $ lift a
 lift3 a = lift $ lift $ lift a
 
--- Runs client
+-- Node functions
 runClientNode :: NodeEnvironment -> TxState -> IO ()
-runClientNode env txstate = connectToUnixSocket (nodeSocketFolder env) (nodeEnvId env) (clientHandler env txstate)
+runClientNode env txstate = connectToUnixSocket (nodeSocketFolder env) (nodeEnvId env) clientHandler
 
-clientHandler :: NodeEnvironment -> TxState -> Conversation -> IO ()
-clientHandler r s c = loop
+clientHandler :: Conversation -> IO ()
+clientHandler c = loop
     where loop :: IO void
           loop = do
             input <- TextIO.getLine
@@ -188,12 +207,10 @@ clientHandler r s c = loop
             loop
 
 runServerNode :: NodeEnvironment -> TxState -> IO ()
-runServerNode env txstate = do
-    ref <- newIORef 0
-    listenUnixSocket (nodeSocketFolder env) (nodeEnvId env) ((True <$) . forkIO . serverHandler env txstate ref)
+runServerNode env txstate = listenUnixSocket (nodeSocketFolder env) (nodeEnvId env) ((True <$) . forkIO . serverHandler env txstate)
 
-serverHandler :: NodeEnvironment -> TxState -> IORef Int -> Conversation -> IO ()
-serverHandler env txstate ref c = void $ runTxAction loop env txstate
+serverHandler :: NodeEnvironment -> TxState -> Conversation -> IO ()
+serverHandler env txstate c = void $ runTxAction loop env txstate
     where loop :: TxMonad void
           loop = do
               input <- lift3 $ recv c
@@ -204,16 +221,16 @@ serverHandler env txstate ref c = void $ runTxAction loop env txstate
                     txstate0 <- lift2 get
                     if verifyTx tx txstate0
                        then do
-                           submitTx tx -- TODO: broadcast this to all known nodes
+                           applyTx tx -- TODO: broadcast this to all known nodes
                            lift3 $ void . forkIO $ do
                                send c $ LBString.toStrict $ Binary.encode tx
                                putStrLn $ "1 " ++ txHash tx
                        else lift3 $ hPutStrLn stderr "0"
                     loop
 
-                ("QUERY": txno : _)             -> do
+                ("QUERY": txid : _)             -> do
                     txstate0 <- lift2 get
-                    case getTxNo (read txno :: Int) (txs txstate0) of
+                    case memberTx txid txstate0 of
                       Just x  -> lift3 $ putStrLn $ "1 " <> txHash x
                       Nothing -> lift3 $ putStrLn "0"
                     loop
@@ -222,6 +239,10 @@ serverHandler env txstate ref c = void $ runTxAction loop env txstate
                     txstate0 <- lift2 get
                     lift3 $ putStrLn $ show $ getUtxo pubkey txstate0
                     loop
+
+                ("RECEIVE" : txbinary : _)         -> do
+                    let tx = Binary.decode (LBString.fromStrict $ C8.pack txbinary) :: Tx
+                    undefined
 
                 _                               -> do
                     lift3 $ hPrint stderr $ "Invalid command: " <> input
@@ -237,4 +258,4 @@ initialEnv :: NodeEnvironment
 initialEnv = NodeEnvironment (NodeId 0) "sockets" 0 0 0 0
 
 initialState :: TxState
-initialState = TxState [] (HM.empty :: HM.Map Address Natural)
+initialState = TxState [] (HM.empty :: HM.Map Hash Tx) (HM.empty :: HM.Map Address Natural)
