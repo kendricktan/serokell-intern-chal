@@ -30,7 +30,9 @@ import qualified Data.ByteString.Base16      as B16
 import qualified Data.ByteString.Base16.Lazy as B16L
 import qualified Data.ByteString.Char8       as C8
 import qualified Data.ByteString.Lazy        as LBString
+import qualified Data.ByteString.Lazy.Char8  as LC8
 import qualified Data.HashMap                as HM
+import qualified Data.String                 as String
 import qualified Data.Text                   as Text
 import qualified Data.Text.IO                as TextIO
 
@@ -76,8 +78,12 @@ instance Aeson.FromJSON Tx
 
 -- Node Environment, Immutable
 data NodeEnvironment = NodeEnvironment
-    { nodeEnvId        :: NodeId
-    , nodeSocketFolder :: String
+    { nodeEnvId         :: NodeId
+    , nodeSocketFolder  :: String
+    , nodeCount         :: Int
+    , disconnectTimeout :: Int
+    , stabilityTimeout  :: Int
+    , resyncTimeout     :: Int
     }
 
 -- TxState (keep track of the transactions and connected nodes)
@@ -174,40 +180,12 @@ runClientNode :: NodeEnvironment -> TxState -> IO ()
 runClientNode env txstate = connectToUnixSocket (nodeSocketFolder env) (nodeEnvId env) (clientHandler env txstate)
 
 clientHandler :: NodeEnvironment -> TxState -> Conversation -> IO ()
-clientHandler r s c = void $ runTxAction loop r s
-    where loop :: TxMonad void
+clientHandler r s c = loop
+    where loop :: IO void
           loop = do
-            input <- lift3 TextIO.getLine
-            case Text.unpack <$> Text.words input of
-              ("SUBMIT" : sk : pk : amnt : _) -> do
-                  let tx = createTx sk pk amnt
-                  txstate0 <- lift2 get
-                  if True -- verifyTx tx txstate0
-                     then do
-                        submitTx tx
-                        lift3 $ void . forkIO $ do
-                            send c $ LBString.toStrict $ Binary.encode tx
-                            (r :: Int) <- Binary.decode . LBString.fromStrict <$> recv c
-                            putStrLn $ "Tx sent, request id " <> show r
-                    else lift3 $ hPutStrLn stderr "0"
-                  loop
-
-              ("QUERY": txno : _)   -> do
-                  txstate0 <- lift2 get
-                  case getTxNo (read txno :: Int) (txs txstate0) of
-                    Just x  -> lift3 $ putStrLn $ "1 " <> txHash x
-                    Nothing -> lift3 $ putStrLn "0"
-                  loop
-
-              ("BALANCE": pubkey : _) -> do
-                  txstate0 <- lift2 get
-                  lift3 $ putStrLn $ show $ getUtxo pubkey txstate0
-                  loop
-
-              _                   -> do
-                  lift3 $ hPrint stderr $ "Invalid command: " <> input
-                  loop
-
+            input <- TextIO.getLine
+            void . forkIO $ send c $ LBString.toStrict $ LC8.pack $ Text.unpack input
+            loop
 
 runServerNode :: NodeEnvironment -> TxState -> IO ()
 runServerNode env txstate = do
@@ -219,14 +197,44 @@ serverHandler env txstate ref c = void $ runTxAction loop env txstate
     where loop :: TxMonad void
           loop = do
               input <- lift3 $ recv c
-              counter <- lift3 $ readIORef ref
-              lift3 $ putStrLn $ "Request id: " <> show counter
-              lift3 $ modifyIORef ref (+1)
-              let tx = Binary.decode (LBString.fromStrict input) :: Tx
-              lift3 $ send c (LBString.toStrict $ Binary.encode input)
-              loop
+
+              case String.words $ C8.unpack input of
+                ("SUBMIT" : sk : pk : amnt : _) -> do
+                    let tx = createTx sk pk amnt
+                    txstate0 <- lift2 get
+                    if verifyTx tx txstate0
+                       then do
+                           submitTx tx -- TODO: broadcast this to all known nodes
+                           lift3 $ void . forkIO $ do
+                               send c $ LBString.toStrict $ Binary.encode tx
+                               putStrLn $ "1 " ++ txHash tx
+                       else lift3 $ hPutStrLn stderr "0"
+                    loop
+
+                ("QUERY": txno : _)             -> do
+                    txstate0 <- lift2 get
+                    case getTxNo (read txno :: Int) (txs txstate0) of
+                      Just x  -> lift3 $ putStrLn $ "1 " <> txHash x
+                      Nothing -> lift3 $ putStrLn "0"
+                    loop
+
+                ("BALANCE" : pubkey : _)        -> do
+                    txstate0 <- lift2 get
+                    lift3 $ putStrLn $ show $ getUtxo pubkey txstate0
+                    loop
+
+                _                               -> do
+                    lift3 $ hPrint stderr $ "Invalid command: " <> input
+                    loop
 
 runNode :: NodeEnvironment -> TxState -> IO ()
 runNode env txstate = do
     void $ forkIO (runServerNode env txstate)
     runClientNode env txstate
+
+
+initialEnv :: NodeEnvironment
+initialEnv = NodeEnvironment (NodeId 0) "sockets" 0 0 0 0
+
+initialState :: TxState
+initialState = TxState [] (HM.empty :: HM.Map Address Natural)
