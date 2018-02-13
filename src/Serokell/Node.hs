@@ -80,7 +80,7 @@ data NodeEnvironment = NodeEnvironment
     , nodeSocketFolder :: String
     }
 
--- Cache State (Keeping track of all the UTXOs)
+-- TxState (keep track of the transactions and connected nodes)
 data TxState = TxState { txs   :: [Tx]
                        , utxos :: HM.Map Address Natural
                        } deriving Show
@@ -170,11 +170,8 @@ lift2 a = lift $ lift a
 lift3 a = lift $ lift $ lift a
 
 -- Runs client
-runClientNode :: TxMonad ()
-runClientNode = do
-    env <- lift ask
-    txstate0 <- lift2 get
-    lift3 $ connectToUnixSocket (nodeSocketFolder env) (nodeEnvId env) (clientHandler env txstate0)
+runClientNode :: NodeEnvironment -> TxState -> IO ()
+runClientNode env txstate = connectToUnixSocket (nodeSocketFolder env) (nodeEnvId env) (clientHandler env txstate)
 
 clientHandler :: NodeEnvironment -> TxState -> Conversation -> IO ()
 clientHandler r s c = void $ runTxAction loop r s
@@ -185,7 +182,7 @@ clientHandler r s c = void $ runTxAction loop r s
               ("SUBMIT" : sk : pk : amnt : _) -> do
                   let tx = createTx sk pk amnt
                   txstate0 <- lift2 get
-                  if verifyTx tx txstate0
+                  if True -- verifyTx tx txstate0
                      then do
                         submitTx tx
                         lift3 $ void . forkIO $ do
@@ -212,12 +209,10 @@ clientHandler r s c = void $ runTxAction loop r s
                   loop
 
 
-runServerNode :: TxMonad ()
-runServerNode = do
-    ref <- lift3 $ newIORef 0
-    env <- lift ask
-    txstate <- lift2 get
-    lift3 $ listenUnixSocket (nodeSocketFolder env) (nodeEnvId env) ((True <$) . forkIO . serverHandler env txstate ref)
+runServerNode :: NodeEnvironment -> TxState -> IO ()
+runServerNode env txstate = do
+    ref <- newIORef 0
+    listenUnixSocket (nodeSocketFolder env) (nodeEnvId env) ((True <$) . forkIO . serverHandler env txstate ref)
 
 serverHandler :: NodeEnvironment -> TxState -> IORef Int -> Conversation -> IO ()
 serverHandler env txstate ref c = void $ runTxAction loop env txstate
@@ -230,3 +225,8 @@ serverHandler env txstate ref c = void $ runTxAction loop env txstate
               let tx = Binary.decode (LBString.fromStrict input) :: Tx
               lift3 $ send c (LBString.toStrict $ Binary.encode input)
               loop
+
+runNode :: NodeEnvironment -> TxState -> IO ()
+runNode env txstate = do
+    void $ forkIO (runServerNode env txstate)
+    runClientNode env txstate
