@@ -4,7 +4,8 @@
 
 module Serokell.Node where
 
-import           Control.Concurrent          (forkIO)
+import           Control.Concurrent          (forkIO, threadDelay)
+import           Control.Concurrent.Async    (mapConcurrently)
 import           Control.Monad               (void)
 import           Control.Monad.Reader        (ReaderT, ask, runReaderT)
 import           Control.Monad.State         (StateT, get, put, runStateT)
@@ -21,6 +22,7 @@ import           Serokell.Communication.IPC  (Conversation (..), NodeId (..),
                                               listenUnixSocket)
 import           System.IO                   (hPrint, hPutStrLn, stderr)
 
+import qualified Control.Concurrent.MVar     as MVar
 import qualified Crypto.Hash.SHA256          as SHA256
 import qualified Crypto.Sign.Ed25519         as ECC
 import qualified Data.Aeson                  as Aeson
@@ -182,8 +184,10 @@ broadcastTx tx = do
     let maxNode = nodeCount env
     let curNode = unNodeId $ nodeEnvId env
     let txbinary = Binary.encode tx
-    let cmd = LC8.pack "SUBMIT " <> txbinary
-    lift3 $ void $ sequence $ (broadcastSocket cmd (nodeSocketFolder env)) <$> (filter ((/=) curNode) [1..maxNode])
+    let cmd = LC8.pack "RECEIVE " <> txbinary
+    undefined
+    -- lift3 $ void . sequence $ (broadcastSocket cmd (nodeSocketFolder env)) <$> (filter ((/=) curNode) [0..maxNode])
+    -- use mapConcurrently https://stackoverflow.com/questions/28169297/how-to-force-main-thread-to-wait-for-all-its-child-threads-finish-in-haskell
 
 broadcastSocket :: LBString.ByteString -> String -> Int -> IO ()
 broadcastSocket bs f i = connectToUnixSocket f (NodeId i) bHandler
@@ -219,12 +223,11 @@ serverHandler env txstate c = void $ runTxAction loop env txstate
                 ("SUBMIT" : sk : pk : amnt : _) -> do
                     let tx = createTx sk pk amnt
                     txstate0 <- lift2 get
-                    if verifyTx tx txstate0
+                    if True -- verifyTx tx txstate0
                        then do
-                           applyTx tx -- TODO: broadcast this to all known nodes
-                           lift3 $ void . forkIO $ do
-                               send c $ LBString.toStrict $ Binary.encode tx
-                               putStrLn $ "1 " ++ txHash tx
+                           applyTx tx -- Apply tx to own ledger
+                           broadcastTx tx -- broadcast tx to other nodes
+                           lift3 $ putStrLn $ "1 " ++ txHash tx
                        else lift3 $ hPutStrLn stderr "0"
                     loop
 
@@ -241,8 +244,15 @@ serverHandler env txstate c = void $ runTxAction loop env txstate
                     loop
 
                 ("RECEIVE" : txbinary : _)         -> do
+                    txstate0 <- lift2 get
                     let tx = Binary.decode (LBString.fromStrict $ C8.pack txbinary) :: Tx
+                       -- if True -- verifyTx tx
+                       --    then do applyTx tx
+                       --            lift3 $ putStrLn $ "1 " ++ txHash tx
+                       --    else undefined -- Blacklist client
+                    lift3 $ print tx
                     undefined
+                    loop
 
                 _                               -> do
                     lift3 $ hPrint stderr $ "Invalid command: " <> input
@@ -251,11 +261,12 @@ serverHandler env txstate c = void $ runTxAction loop env txstate
 runNode :: NodeEnvironment -> TxState -> IO ()
 runNode env txstate = do
     void $ forkIO (runServerNode env txstate)
+    threadDelay 500000 -- Mitigate the race condition of making the socket file
     runClientNode env txstate
 
 
-initialEnv :: NodeEnvironment
-initialEnv = NodeEnvironment (NodeId 0) "sockets" 0 0 0 0
+initialEnv = NodeEnvironment (NodeId 0) "sockets" 1 0 0 0
 
-initialState :: TxState
+initialEnv2 = NodeEnvironment (NodeId 1) "sockets" 1 0 0 0
+
 initialState = TxState [] (HM.empty :: HM.Map Hash Tx) (HM.empty :: HM.Map Address Natural)
