@@ -22,7 +22,7 @@ import           Serokell.Communication.IPC  (Conversation (..), NodeId (..),
                                               listenUnixSocket)
 import           System.IO                   (hPrint, hPutStrLn, stderr)
 
-import qualified Control.Concurrent.MVar     as MVar
+import qualified Control.Concurrent.MVar     as MV
 import qualified Crypto.Hash.SHA256          as SHA256
 import qualified Crypto.Sign.Ed25519         as ECC
 import qualified Data.Aeson                  as Aeson
@@ -185,14 +185,12 @@ broadcastTx tx = do
     let curNode = unNodeId $ nodeEnvId env
     let txbinary = Binary.encode tx
     let cmd = LC8.pack "RECEIVE " <> txbinary
-    undefined
-    -- lift3 $ void . sequence $ (broadcastSocket cmd (nodeSocketFolder env)) <$> (filter ((/=) curNode) [0..maxNode])
-    -- use mapConcurrently https://stackoverflow.com/questions/28169297/how-to-force-main-thread-to-wait-for-all-its-child-threads-finish-in-haskell
+    _ <- lift3 $ void $ mapConcurrently (broadcastSocket cmd (nodeSocketFolder env)) (filter ((/=) curNode) [0..maxNode])
 
 broadcastSocket :: LBString.ByteString -> String -> Int -> IO ()
 broadcastSocket bs f i = connectToUnixSocket f (NodeId i) bHandler
     where bHandler :: Conversation -> IO ()
-          bHandler c = void . forkIO $ send c $ LBString.toStrict $ bs
+          bHandler c = void $ send c $ LBString.toStrict $ bs
 
 -- Lens maybe?
 lift2 a = lift $ lift a
@@ -204,18 +202,21 @@ runClientNode env txstate = connectToUnixSocket (nodeSocketFolder env) (nodeEnvI
 
 clientHandler :: Conversation -> IO ()
 clientHandler c = loop
-    where loop :: IO void
+    where loop :: IO ()
           loop = do
             input <- TextIO.getLine
-            void . forkIO $ send c $ LBString.toStrict $ LC8.pack $ Text.unpack input
-            loop
+            case Text.words input of
+              ("QUIT" : _) -> do void $ send c $ LBString.toStrict $ LC8.pack $ Text.unpack input
+                                 return ()
+              _            -> do void . forkIO $ send c $ LBString.toStrict $ LC8.pack $ Text.unpack input
+                                 loop
 
 runServerNode :: NodeEnvironment -> TxState -> IO ()
 runServerNode env txstate = listenUnixSocket (nodeSocketFolder env) (nodeEnvId env) ((True <$) . forkIO . serverHandler env txstate)
 
 serverHandler :: NodeEnvironment -> TxState -> Conversation -> IO ()
 serverHandler env txstate c = void $ runTxAction loop env txstate
-    where loop :: TxMonad void
+    where loop :: TxMonad ()
           loop = do
               input <- lift3 $ recv c
 
@@ -246,13 +247,14 @@ serverHandler env txstate c = void $ runTxAction loop env txstate
                 ("RECEIVE" : txbinary : _)         -> do
                     txstate0 <- lift2 get
                     let tx = Binary.decode (LBString.fromStrict $ C8.pack txbinary) :: Tx
-                       -- if True -- verifyTx tx
-                       --    then do applyTx tx
-                       --            lift3 $ putStrLn $ "1 " ++ txHash tx
-                       --    else undefined -- Blacklist client
+                    if True -- verifyTx tx txstate0
+                       then do applyTx tx
+                               lift3 $ putStrLn $ "1 " ++ txHash tx
+                       else undefined -- Blacklist client
                     lift3 $ print tx
-                    undefined
                     loop
+
+                ("QUIT": _)                     -> return ()
 
                 _                               -> do
                     lift3 $ hPrint stderr $ "Invalid command: " <> input
@@ -261,7 +263,9 @@ serverHandler env txstate c = void $ runTxAction loop env txstate
 runNode :: NodeEnvironment -> TxState -> IO ()
 runNode env txstate = do
     void $ forkIO (runServerNode env txstate)
-    threadDelay 500000 -- Mitigate the race condition of making the socket file
+    -- Mitigate the race condition of making the socket file
+    -- sleep for 500 milliseconds
+    threadDelay 500000
     runClientNode env txstate
 
 
