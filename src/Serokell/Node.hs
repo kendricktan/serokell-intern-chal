@@ -4,14 +4,10 @@
 
 module Serokell.Node where
 
-import           Control.Concurrent          (forkIO, threadDelay)
+import           Control.Concurrent          (forkIO, killThread, threadDelay)
 import           Control.Concurrent.Async    (mapConcurrently)
 import           Control.Monad               (void)
-import           Control.Monad.Reader        (ReaderT, ask, runReaderT)
-import           Control.Monad.State         (StateT, get, put, runStateT)
 import           Control.Monad.Trans         (lift, liftIO)
-import           Control.Monad.Trans.Except  (ExceptT, runExceptT)
-import           Data.Either                 (Either, either)
 import           Data.IORef                  (IORef, modifyIORef, newIORef,
                                               readIORef)
 import           Data.Semigroup              ((<>))
@@ -38,20 +34,6 @@ import qualified Data.String                 as String
 import qualified Data.Text                   as Text
 import qualified Data.Text.IO                as TextIO
 
--- TxAction Monad
--- e = Environment
--- s = State
-type TxAction e s = ExceptT TxError (ReaderT e (StateT s IO))
-
-runTxAction :: TxAction r s a -> r -> s -> IO (Either TxError a, s)
-runTxAction action env0 = runStateT (runReaderT (runExceptT action) env0)
-
-evalTxAction :: TxAction r s a -> r -> s -> IO (Maybe a)
-evalTxAction action env0 state0 = do
-    (result, state1) <- runTxAction action env0 state0
-    either (\x -> hPrint stderr x >> return Nothing) (return . Just) result
-
-
 -- Blockchain Primitives
 type Hash    = String
 type Address = String
@@ -66,17 +48,6 @@ data Tx = Tx { txHash   :: Hash     -- Hash of the tx
 -- Error Handling
 data TxError = TxSubmitError
              | TxQueryError deriving Show
-
--- Tx -> Binary
-instance Binary.Binary Tx
-
-instance Aeson.ToJSON NodeId
-
-instance Aeson.ToJSON Tx
-
-instance Aeson.FromJSON NodeId
-
-instance Aeson.FromJSON Tx
 
 -- Node Environment, Immutable
 data NodeEnvironment = NodeEnvironment
@@ -94,9 +65,17 @@ data TxState = TxState { txs   :: [Tx]
                        , utxos :: HM.Map Address Natural
                        } deriving Show
 
--- DRY
-type TxMonad a = TxAction NodeEnvironment TxState a
 
+-- Tx -> Binary
+instance Binary.Binary Tx
+
+instance Aeson.ToJSON NodeId
+
+instance Aeson.ToJSON Tx
+
+instance Aeson.FromJSON NodeId
+
+instance Aeson.FromJSON Tx
 -- Helper functions
 
 -- Base16 encode
@@ -162,30 +141,26 @@ createTx sk txto amnt = Tx txhash txsig txfr txto txamnt
           txhash = getTxHash txtmp
           txsig = signTx txtmp (b16dsk sk)
 
-applyTx :: Tx -> TxMonad ()
-applyTx tx = do
-    txstate0 <- lift2 get
-    let txs1 = tx : txs txstate0
-     -- Calculate new utxo values
-    let txfromutxo = getUtxo (txFrom tx) txstate0 - txAmount tx
-    let txtoutxo = getUtxo (txTo tx) txstate0 + txAmount tx
-    -- Update local state
-    let txshm1 = HM.insert (txHash tx) tx (txshm txstate0)
-    let utxos1 = HM.insert (txFrom tx) txfromutxo (utxos txstate0)
-    let utxos2 = HM.insert (txTo tx) txtoutxo utxos1
-    put (TxState txs1 txshm1 utxos2)
+applyTx :: Tx -> TxState -> TxState
+applyTx tx txstate = TxState txs1 txshm1 utxos2
+    where txs1 = tx : txs txstate
+          -- Calculate new utxo values
+          txfromutxo = getUtxo (txFrom tx) txstate - txAmount tx
+          txtoutxo = getUtxo (txTo tx) txstate + txAmount tx
+          -- Update local state
+          txshm1 = HM.insert (txHash tx) tx (txshm txstate)
+          utxos1 = HM.insert (txFrom tx) txfromutxo (utxos txstate)
+          utxos2 = HM.insert (txTo tx) txtoutxo utxos1
 
 memberTx :: Hash -> TxState -> Maybe Tx
 memberTx h txstate0 = HM.lookup h (txshm txstate0)
 
-broadcastTx :: Tx -> TxMonad ()
-broadcastTx tx = do
-    env <- lift ask
-    let maxNode = nodeCount env
-    let curNode = unNodeId $ nodeEnvId env
-    let txbinary = Binary.encode tx
-    let cmd = LC8.pack "RECEIVE " <> txbinary
-    _ <- lift3 $ void $ mapConcurrently (broadcastSocket cmd (nodeSocketFolder env)) (filter ((/=) curNode) [0..maxNode])
+broadcastTx :: Tx -> NodeEnvironment -> IO ()
+broadcastTx tx env = void $ mapConcurrently (broadcastSocket cmd (nodeSocketFolder env)) (filter ((/=) curNode) [0..maxNode])
+    where maxNode = nodeCount env
+          curNode = unNodeId $ nodeEnvId env
+          txbinary = Binary.encode tx
+          cmd = LC8.pack "RECEIVE " <> txbinary
 
 broadcastSocket :: LBString.ByteString -> String -> Int -> IO ()
 broadcastSocket bs f i = connectToUnixSocket f (NodeId i) bHandler
@@ -197,76 +172,80 @@ lift2 a = lift $ lift a
 lift3 a = lift $ lift $ lift a
 
 -- Node functions
-runClientNode :: NodeEnvironment -> TxState -> IO ()
-runClientNode env txstate = connectToUnixSocket (nodeSocketFolder env) (nodeEnvId env) clientHandler
+runClient :: NodeEnvironment -> TxState -> IO ()
+runClient env txstate = connectToUnixSocket (nodeSocketFolder env) (nodeEnvId env) clientHandler
 
 clientHandler :: Conversation -> IO ()
 clientHandler c = loop
     where loop :: IO ()
           loop = do
             input <- TextIO.getLine
+            void $ send c $ LBString.toStrict $ LC8.pack $ Text.unpack input
+
             case Text.words input of
-              ("QUIT" : _) -> do void $ send c $ LBString.toStrict $ LC8.pack $ Text.unpack input
-                                 return ()
-              _            -> do void . forkIO $ send c $ LBString.toStrict $ LC8.pack $ Text.unpack input
-                                 loop
+              ("QUIT" : _) -> return ()
+              _            -> loop
 
-runServerNode :: NodeEnvironment -> TxState -> IO ()
-runServerNode env txstate = listenUnixSocket (nodeSocketFolder env) (nodeEnvId env) ((True <$) . forkIO . serverHandler env txstate)
+runServer :: NodeEnvironment -> TxState -> IO ()
+runServer env txstate0 = do
+    ref <- newIORef txstate0
+    listenUnixSocket (nodeSocketFolder env) (nodeEnvId env) ((True <$) . forkIO . serverHandler ref)
+        where
+            serverHandler :: IORef TxState -> Conversation -> IO ()
+            serverHandler ref c = loop
+                    where
+                        loop :: IO ()
+                        loop = do
+                            input <- recv c
+                            txstate1 <- readIORef ref
 
-serverHandler :: NodeEnvironment -> TxState -> Conversation -> IO ()
-serverHandler env txstate c = void $ runTxAction loop env txstate
-    where loop :: TxMonad ()
-          loop = do
-              input <- lift3 $ recv c
+                            case String.words $ C8.unpack input of
+                              ("SUBMIT" : sk : pk : amnt : _) -> do
+                                  let tx = createTx sk pk amnt
+                                  if True -- verifyTx tx txstate0
+                                     then do
+                                         broadcastTx tx env
+                                         putStrLn $ "1 " ++ txHash tx
+                                     else hPutStrLn stderr "0"
+                                  modifyIORef ref (applyTx tx)
+                                  loop
 
-              case String.words $ C8.unpack input of
-                ("SUBMIT" : sk : pk : amnt : _) -> do
-                    let tx = createTx sk pk amnt
-                    txstate0 <- lift2 get
-                    if True -- verifyTx tx txstate0
-                       then do
-                           applyTx tx -- Apply tx to own ledger
-                           broadcastTx tx -- broadcast tx to other nodes
-                           lift3 $ putStrLn $ "1 " ++ txHash tx
-                       else lift3 $ hPutStrLn stderr "0"
-                    loop
+                              ("QUERY": txid : _)             -> do
+                                  case memberTx txid txstate0 of
+                                    Just x  -> putStrLn $ "1 " <> txHash x
+                                    Nothing -> putStrLn "0"
+                                  loop
 
-                ("QUERY": txid : _)             -> do
-                    txstate0 <- lift2 get
-                    case memberTx txid txstate0 of
-                      Just x  -> lift3 $ putStrLn $ "1 " <> txHash x
-                      Nothing -> lift3 $ putStrLn "0"
-                    loop
+                              ("BALANCE" : pubkey : _)        -> do
+                                  putStrLn $ show $ getUtxo pubkey txstate0
+                                  loop
 
-                ("BALANCE" : pubkey : _)        -> do
-                    txstate0 <- lift2 get
-                    lift3 $ putStrLn $ show $ getUtxo pubkey txstate0
-                    loop
+                              ("RECEIVE" : txbinary : _)         -> do
+                                  let tx = Binary.decode (LBString.fromStrict $ C8.pack txbinary) :: Tx
+                                  if True -- verifyTx tx txstate0
+                                     then do putStrLn $ "1 " ++ txHash tx
+                                             print tx
+                                             modifyIORef ref (applyTx tx)
+                                     else undefined -- Blacklist client
+                                  loop
 
-                ("RECEIVE" : txbinary : _)         -> do
-                    txstate0 <- lift2 get
-                    let tx = Binary.decode (LBString.fromStrict $ C8.pack txbinary) :: Tx
-                    if True -- verifyTx tx txstate0
-                       then do applyTx tx
-                               lift3 $ putStrLn $ "1 " ++ txHash tx
-                       else undefined -- Blacklist client
-                    lift3 $ print tx
-                    loop
+                              ("QUIT": _)                     -> do
+                                  putStrLn "quitting..."
+                                  loop
 
-                ("QUIT": _)                     -> return ()
-
-                _                               -> do
-                    lift3 $ hPrint stderr $ "Invalid command: " <> input
-                    loop
+                              _                               -> do
+                                  hPrint stderr $ "Invalid command: " <> input
+                                  loop
 
 runNode :: NodeEnvironment -> TxState -> IO ()
 runNode env txstate = do
-    void $ forkIO (runServerNode env txstate)
+    threadId <- forkIO (runServer env txstate)
     -- Mitigate the race condition of making the socket file
     -- sleep for 500 milliseconds
     threadDelay 500000
-    runClientNode env txstate
+    runClient env txstate
+    -- Kill thread once client node is done running
+    killThread threadId
 
 
 initialEnv = NodeEnvironment (NodeId 0) "sockets" 1 0 0 0
