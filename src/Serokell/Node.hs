@@ -208,17 +208,14 @@ runServer env txstate0 = do
                                          putStrLn $ "1 " ++ txHash tx
                                      else hPutStrLn stderr "0"
                                   modifyIORef ref (applyTx tx)
-                                  loop
 
                               ("QUERY": txid : _)             -> do
                                   case memberTx txid txstate0 of
                                     Just x  -> putStrLn $ "1 " <> txHash x
                                     Nothing -> putStrLn "0"
-                                  loop
 
                               ("BALANCE" : pubkey : _)        -> do
                                   putStrLn $ show $ getUtxo pubkey txstate0
-                                  loop
 
                               ("RECEIVE" : txbinary : _)         -> do
                                   let tx = Binary.decode (LBString.fromStrict $ C8.pack txbinary) :: Tx
@@ -227,15 +224,16 @@ runServer env txstate0 = do
                                              print tx
                                              modifyIORef ref (applyTx tx)
                                      else undefined -- Blacklist client
-                                  loop
+                                  print tx
 
                               ("QUIT": _)                     -> do
                                   putStrLn "quitting..."
-                                  loop
 
                               _                               -> do
                                   hPrint stderr $ "Invalid command: " <> input
-                                  loop
+
+                            send c $ LBString.toStrict $ LC8.pack "."
+                            loop
 
 runNode :: NodeEnvironment -> TxState -> IO ()
 runNode env txstate = do
