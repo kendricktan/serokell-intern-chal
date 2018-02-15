@@ -6,6 +6,7 @@ module Serokell.Node where
 
 import           Control.Concurrent          (forkIO, killThread, threadDelay)
 import           Control.Concurrent.Async    (mapConcurrently)
+import           Control.Exception.Base      (catch, try, IOException)
 import           Control.Monad               (void)
 import           Control.Monad.Trans         (lift, liftIO)
 import           Data.IORef                  (IORef, modifyIORef, newIORef,
@@ -34,7 +35,9 @@ import qualified Data.String                 as String
 import qualified Data.Text                   as Text
 import qualified Data.Text.IO                as TextIO
 
--- Blockchain Primitives
+---- Blockchain Primitives
+---------------------------------
+
 type Hash    = String
 type Address = String
 
@@ -52,7 +55,7 @@ data TxError = TxSubmitError
 
 -- Node Environment, Immutable
 data NodeEnvironment = NodeEnvironment
-    { nodeEnvId         :: NodeId
+    { nodeId            :: NodeId
     , nodeSocketFolder  :: String
     , nodeCount         :: Int
     , disconnectTimeout :: Int
@@ -78,6 +81,10 @@ instance Aeson.FromJSON NodeId
 
 instance Aeson.FromJSON Tx
 -- Helper functions
+
+
+---- Helper functions
+---------------------------------
 
 -- Base16 encode
 b16e x = C8.unpack $ B16.encode x
@@ -108,6 +115,9 @@ getSKAddress = b16pk . ECC.toPublicKey
 -- Get hash of a tx
 getTxHashBString :: Tx -> BString.ByteString
 getTxHashBString (Tx _ p _ f t a) = SHA256.hash $ C8.pack $ concat $ show <$> [p, f, t, show a]
+
+getTxLength :: TxState -> Int
+getTxLength = length . txs
 
 getTxHash :: Tx -> Hash
 getTxHash = b16e . getTxHashBString
@@ -157,21 +167,26 @@ memberTx :: Hash -> TxState -> Maybe Tx
 memberTx h txstate0 = HM.lookup h (txshm txstate0)
 
 broadcastTx :: Tx -> NodeEnvironment -> IO ()
-broadcastTx tx env = void $ mapConcurrently (broadcastSocket cmd (nodeSocketFolder env)) (filter ((/=) curNode) [0..maxNode])
+broadcastTx tx env = void $ mapConcurrently (broadcastSocket cmd (nodeSocketFolder env)) (filter (curNode /=) [0..maxNode])
     where maxNode = nodeCount env
-          curNode = unNodeId $ nodeEnvId env
+          curNode = unNodeId $ nodeId env
           txbinary = Binary.encode tx
           cmd = LC8.pack "RECEIVE " <> txbinary
 
 broadcastSocket :: LBString.ByteString -> String -> Int -> IO ()
 broadcastSocket bs f i = connectToUnixSocket f (NodeId i) bHandler
     where bHandler :: Conversation -> IO ()
-          bHandler c = void $ send c $ LBString.toStrict $ bs
+          bHandler c = void $ send c $ LBString.toStrict bs
 
+newNodeEnv :: NodeEnvironment -> NodeEnvironment
+newNodeEnv (NodeEnvironment i f c d s r) = NodeEnvironment nid f c d s r
+    where nid = NodeId $ head $ filter ((unNodeId i) /=) [0..c]
 
--- Node functions
+---- Node controller
+---------------------------------
+
 runClient :: NodeEnvironment -> IO ()
-runClient env = connectToUnixSocket (nodeSocketFolder env) (nodeEnvId env) clientHandler
+runClient env = connectToUnixSocket (nodeSocketFolder env) (nodeId env) clientHandler
 
 clientHandler :: Conversation -> IO ()
 clientHandler c = loop
@@ -183,12 +198,11 @@ clientHandler c = loop
                                putStrLn $ C8.unpack resp
             loop
 
-sends c s = send c $ LBString.toStrict $ LC8.pack $ s
+sends c s = send c $ LBString.toStrict $ LC8.pack s
 
-runServer :: NodeEnvironment -> TxState -> IO ()
-runServer env txstate0 = do
-    ref <- newIORef txstate0
-    listenUnixSocket (nodeSocketFolder env) (nodeEnvId env) ((True <$) . forkIO . serverHandler ref)
+runServer :: IORef TxState -> NodeEnvironment -> IO ()
+runServer ref env =
+    listenUnixSocket (nodeSocketFolder env) (nodeId env) ((True <$) . forkIO . serverHandler ref)
         where
             serverHandler :: IORef TxState -> Conversation -> IO ()
             serverHandler ref c = loop
@@ -208,10 +222,18 @@ runServer env txstate0 = do
                                          sends c $ "1 " ++ txHash tx
                                      else hPutStrLn stderr "0"
 
-                              ("QUERY": txid : _)             -> do
+                              ("QUERY" : txid : _)             -> do
                                   case memberTx txid txstate1 of
                                     Just x  -> sends c $ "1 " <> txHash x
                                     Nothing -> sends c "0"
+
+                              ("GETTX" : txno : _)            -> do
+                                  case getTxNo (read txno) (txs txstate1) of
+                                    Just x  -> send c $ LBString.toStrict $ Binary.encode x
+                                    Nothing -> sends c "0"
+
+                              ("LATESTTX" : _)                -> do
+                                  sends c $ show $ getTxLength txstate1
 
                               ("BALANCE" : pubkey : _)        -> do
                                   sends c $ show $ getUtxo pubkey txstate1
@@ -220,7 +242,7 @@ runServer env txstate0 = do
                                   let tx = Binary.decode (LBString.fromStrict $ C8.pack txbinary) :: Tx
                                   if verifyTx tx txstate1
                                      then do modifyIORef ref (applyTx tx)
-                                             sends c $ "1 " ++ txHash tx
+                                             void (try $ sends c $ "1 " ++ txHash tx :: IO (Either IOException ()))
                                      else sends c $ "0"
 
                               _                               -> do
@@ -228,21 +250,52 @@ runServer env txstate0 = do
 
                             loop
 
+-- Syncs disconnected node
+syncNode :: IORef TxState -> NodeEnvironment -> IO ()
+syncNode ref env = connectToUnixSocket (nodeSocketFolder env) (nodeId env) (syncHandler ref)
+    where syncHandler :: IORef TxState -> Conversation -> IO ()
+          syncHandler ref c = loop
+              where loop :: IO ()
+                    loop = do
+                        txstate0 <- readIORef ref
+
+                        sends c "LATESTTX"
+                        (h :: Int) <- Binary.decode . LBString.fromStrict <$> recv c
+
+                        -- Have we finished syncing?
+                        case h <= getTxLength txstate0 of
+                          True  -> return ()
+                          False -> do
+                              sends c $ "GETTX " ++ (show . (+1) . getTxLength) txstate0
+                              tx :: Tx <- Binary.decode . LBString.fromStrict <$> recv c
+                              if verifyTx tx txstate0
+                                 then do modifyIORef ref (applyTx tx)
+                                         loop
+                                 else syncNode ref (newNodeEnv env) -- Adversarial? Disconnect and connect to another node
+
+
 runNode :: NodeEnvironment -> TxState -> IO ()
 runNode env txstate = do
-    threadId <- forkIO (runServer env txstate)
+    ref <- newIORef txstate
+
+    -- catch (syncNode ref env) (\_ -> putStrLn "No nodes found, syncing skipped!")
+    threadId <- forkIO (runServer ref env)
     -- Mitigate the race condition of making the socket file
     -- sleep for 500 milliseconds
     threadDelay 500000
     runClient env
 
 
+---- Testing
+---------------
+
+
 initialEnv = NodeEnvironment (NodeId 0) "sockets" 1 0 0 0
 
 initialEnv2 = NodeEnvironment (NodeId 1) "sockets" 1 0 0 0
 
-gh = "0000000000000000000000000000000000000000000000000000000000000000"
+genesisHash = "0000000000000000000000000000000000000000000000000000000000000000"
 
-genesisTx = Tx gh gh gh gh gh 0
+genesisTx = Tx genesisHash genesisHash genesisHash genesisHash genesisHash 0
 
 initialState = TxState [genesisTx] (HM.empty :: HM.Map Hash Tx) (HM.empty :: HM.Map Address Natural)
