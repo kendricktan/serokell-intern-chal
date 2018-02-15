@@ -62,6 +62,7 @@ executable serokell-intern-chal-exe
   ghc-options: -threaded -rtsopts -with-rtsopts=-N
   build-depends:
       base >=4.7 && <5
+    , hashmap
     , serokell-intern-chal
   other-modules:
       Paths_serokell_intern_chal

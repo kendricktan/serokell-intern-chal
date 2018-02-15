@@ -38,11 +38,12 @@ import qualified Data.Text.IO                as TextIO
 type Hash    = String
 type Address = String
 
-data Tx = Tx { txHash   :: Hash     -- Hash of the tx
-             , txSig    :: Hash     -- Signature of the tx
-             , txFrom   :: Address  -- Who are we sending it to
-             , txTo     :: Address  -- Who is receiving it
-             , txAmount :: Natural  -- How much
+data Tx = Tx { txHash     :: Hash     -- Hash of the tx
+             , txPrevHash :: Hash -- Hash of previous tx
+             , txSig      :: Hash     -- Signature of the tx
+             , txFrom     :: Address  -- Who are we sending it to
+             , txTo       :: Address  -- Who is receiving it
+             , txAmount   :: Natural  -- How much
              } deriving (Eq, Ord, Generic, Show)
 
 -- Error Handling
@@ -106,7 +107,7 @@ getSKAddress = b16pk . ECC.toPublicKey
 
 -- Get hash of a tx
 getTxHashBString :: Tx -> BString.ByteString
-getTxHashBString (Tx _ _ f t a) = SHA256.hash $ C8.pack $ concat $ show <$> [f, t, show a]
+getTxHashBString (Tx _ p _ f t a) = SHA256.hash $ C8.pack $ concat $ show <$> [p, f, t, show a]
 
 getTxHash :: Tx -> Hash
 getTxHash = b16e . getTxHashBString
@@ -123,23 +124,23 @@ getTxNo i x@(xh : xt) = if length x == i
                            else getTxNo i xt
 
 -- Sign a tx
-signTx :: Tx -> ECC.SecretKey -> String
-signTx tx sk = b16e $ ECC.sign sk (getTxHashBString tx)
+signTxHash :: Hash -> ECC.SecretKey -> String
+signTxHash h sk = b16e $ ECC.sign sk (C8.pack h)
 
 -- Is the tx valid?
 -- Checks if we have enough , then checks the signature
 verifyTx :: Tx -> TxState -> Bool
 verifyTx tx txstate = case HM.lookup (txFrom tx) (utxos txstate) of
                         Nothing -> False
-                        Just x  -> (x >= txAmount tx) && ECC.verify (b16dpk (txFrom tx)) (getTxHashBString tx)
+                        Just x  -> (x >= txAmount tx) && ECC.verify (b16dpk (txFrom tx)) (fst . b16d $ txSig tx)
 
-createTx :: String -> String -> String -> Tx
-createTx sk txto amnt = Tx txhash txsig txfr txto txamnt
+createTx :: String -> String -> String -> TxState -> Tx
+createTx sk txto amnt txstate = Tx txhash txprevhash txsig txfr txto txamnt
     where txamnt = read amnt :: Natural
           txfr = getSKAddress (b16dsk sk)
-          txtmp = Tx "" "" txfr txto txamnt
-          txhash = getTxHash txtmp
-          txsig = signTx txtmp (b16dsk sk)
+          txprevhash = txHash . head $ txs txstate
+          txhash = getTxHash (Tx "" txprevhash "" txfr txto txamnt)
+          txsig = signTxHash txhash (b16dsk sk)
 
 applyTx :: Tx -> TxState -> TxState
 applyTx tx txstate = TxState txs1 txshm1 utxos2
@@ -167,24 +168,22 @@ broadcastSocket bs f i = connectToUnixSocket f (NodeId i) bHandler
     where bHandler :: Conversation -> IO ()
           bHandler c = void $ send c $ LBString.toStrict $ bs
 
--- Lens maybe?
-lift2 a = lift $ lift a
-lift3 a = lift $ lift $ lift a
 
 -- Node functions
-runClient :: NodeEnvironment -> TxState -> IO ()
-runClient env txstate = connectToUnixSocket (nodeSocketFolder env) (nodeEnvId env) clientHandler
+runClient :: NodeEnvironment -> IO ()
+runClient env = connectToUnixSocket (nodeSocketFolder env) (nodeEnvId env) clientHandler
 
 clientHandler :: Conversation -> IO ()
 clientHandler c = loop
     where loop :: IO ()
           loop = do
             input <- TextIO.getLine
-            void $ send c $ LBString.toStrict $ LC8.pack $ Text.unpack input
+            void . forkIO $ do send c $ LBString.toStrict $ LC8.pack $ Text.unpack input
+                               resp <- recv c
+                               putStrLn $ C8.unpack resp
+            loop
 
-            case Text.words input of
-              ("QUIT" : _) -> return ()
-              _            -> loop
+sends c s = send c $ LBString.toStrict $ LC8.pack $ s
 
 runServer :: NodeEnvironment -> TxState -> IO ()
 runServer env txstate0 = do
@@ -201,38 +200,32 @@ runServer env txstate0 = do
 
                             case String.words $ C8.unpack input of
                               ("SUBMIT" : sk : pk : amnt : _) -> do
-                                  let tx = createTx sk pk amnt
-                                  if True -- verifyTx tx txstate0
+                                  let tx = createTx sk pk amnt txstate1
+                                  if verifyTx tx txstate1
                                      then do
+                                         modifyIORef ref (applyTx tx)
                                          broadcastTx tx env
-                                         putStrLn $ "1 " ++ txHash tx
+                                         sends c $ "1 " ++ txHash tx
                                      else hPutStrLn stderr "0"
-                                  modifyIORef ref (applyTx tx)
 
                               ("QUERY": txid : _)             -> do
-                                  case memberTx txid txstate0 of
-                                    Just x  -> putStrLn $ "1 " <> txHash x
-                                    Nothing -> putStrLn "0"
+                                  case memberTx txid txstate1 of
+                                    Just x  -> sends c $ "1 " <> txHash x
+                                    Nothing -> sends c "0"
 
                               ("BALANCE" : pubkey : _)        -> do
-                                  putStrLn $ show $ getUtxo pubkey txstate0
+                                  sends c $ show $ getUtxo pubkey txstate1
 
                               ("RECEIVE" : txbinary : _)         -> do
                                   let tx = Binary.decode (LBString.fromStrict $ C8.pack txbinary) :: Tx
-                                  if True -- verifyTx tx txstate0
-                                     then do putStrLn $ "1 " ++ txHash tx
-                                             print tx
-                                             modifyIORef ref (applyTx tx)
-                                     else undefined -- Blacklist client
-                                  print tx
-
-                              ("QUIT": _)                     -> do
-                                  putStrLn "quitting..."
+                                  if verifyTx tx txstate1
+                                     then do modifyIORef ref (applyTx tx)
+                                             sends c $ "1 " ++ txHash tx
+                                     else sends c $ "0"
 
                               _                               -> do
-                                  hPrint stderr $ "Invalid command: " <> input
+                                  sends c $ C8.unpack $ "Invalid command: " <> input
 
-                            send c $ LBString.toStrict $ LC8.pack "."
                             loop
 
 runNode :: NodeEnvironment -> TxState -> IO ()
@@ -241,13 +234,15 @@ runNode env txstate = do
     -- Mitigate the race condition of making the socket file
     -- sleep for 500 milliseconds
     threadDelay 500000
-    runClient env txstate
-    -- Kill thread once client node is done running
-    killThread threadId
+    runClient env
 
 
 initialEnv = NodeEnvironment (NodeId 0) "sockets" 1 0 0 0
 
 initialEnv2 = NodeEnvironment (NodeId 1) "sockets" 1 0 0 0
 
-initialState = TxState [] (HM.empty :: HM.Map Hash Tx) (HM.empty :: HM.Map Address Natural)
+gh = "0000000000000000000000000000000000000000000000000000000000000000"
+
+genesisTx = Tx gh gh gh gh gh 0
+
+initialState = TxState [genesisTx] (HM.empty :: HM.Map Hash Tx) (HM.empty :: HM.Map Address Natural)
