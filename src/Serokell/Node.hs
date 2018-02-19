@@ -244,7 +244,7 @@ runServer ref env =
 
                               ("GETTX" : txno : _)            -> do
                                   case getTxNo (read txno) (txs txstate1) of
-                                    Just x  -> send c $ LBString.toStrict $ Binary.encode x
+                                    Just x  -> send c $ LBString.toStrict $ "1 " <> Binary.encode x
                                     Nothing -> sends c "0"
 
                               ("LATESTTX" : _)                -> do
@@ -254,10 +254,10 @@ runServer ref env =
                                   sends c $ show $ getUtxo pubkey txstate1
 
                               ("RECEIVE" : txbinary : _)         -> do
-                                  let tx = Binary.decode (LBString.fromStrict $ C8.pack txbinary) :: Tx
+                                  let tx = Binary.decode (LBString.fromStrict $ BString.drop 8 input) :: Tx
                                   if verifyTx tx txstate1
                                      then do modifyMVar_ ref (\s -> return (applyTx tx s))
-                                             putStrLn $ "1 " ++ txHash tx
+                                             putStrLn $ "RECEIVED: " ++ txHash tx
                                      else sends c $ "0"
 
                               _                               -> do
@@ -272,12 +272,13 @@ syncNode refSync refState did env =
           False -> case nodeCount env == (unNodeId $ nodeId env) of
                         True -> do putMVar refSync ()
                                    threadDelay (resyncTimeout env)
-                        False -> case newPeer env did of
+                        False -> reconnectToNewPeer)
+    where reconnectToNewPeer :: IO()
+          reconnectToNewPeer = case newPeer env did of
                                    Just e -> syncNode refSync refState did e
                                    Nothing -> do putMVar refSync ()
                                                  threadDelay (resyncTimeout env)
-    )
-    where syncHandler :: MTxState -> Conversation -> IO ()
+          syncHandler :: MTxState -> Conversation -> IO ()
           syncHandler refState c = loop
               where loop :: IO ()
                     loop = do
@@ -289,15 +290,14 @@ syncNode refSync refState did env =
                         case String.words $ C8.unpack resp of
                           ["0"] -> do putMVar refSync ()
                                       threadDelay (resyncTimeout env)
-                          _  -> do
-                              let tx = Binary.decode (LBString.fromStrict resp) :: Tx
+                          ("1" : _)  -> do
+                              let tx = Binary.decode (LBString.fromStrict (BString.drop 2 resp)) :: Tx
                               if verifyTx tx txstate0
                                  then do modifyMVar_ refState (\s -> return $ applyTx tx s)
                                          putStrLn $ "SYCNED: " ++ txHash tx
-                                 else case newPeer env did of
-                                        Just e -> syncNode refSync refState did e
-                                        Nothing -> do putMVar refSync () -- Reached end of our nodes
-                                                      threadDelay (resyncTimeout env)
+                                 else reconnectToNewPeer
+                          _ -> reconnectToNewPeer
+
                         syncNode refSync refState did env
 
 runNode :: NodeEnvironment -> TxState -> IO ()
