@@ -19,7 +19,7 @@ import           Numeric.Natural             (Natural)
 import           Serokell.Communication.IPC  (Conversation (..), NodeId (..),
                                               connectToUnixSocket,
                                               listenUnixSocket)
-import           System.Directory            (doesFileExist)
+import           System.Directory            (doesFileExist, removeFile)
 import           System.IO                   (hPrint, hPutStrLn, stderr)
 
 import qualified Control.Concurrent.MVar     as MV
@@ -253,11 +253,11 @@ runServer ref env =
                               ("BALANCE" : pubkey : _)        -> do
                                   sends c $ show $ getUtxo pubkey txstate1
 
-                              ("RECEIVE" : txbinary : _)         -> do
+                              ("RECEIVE" : _)         -> do
                                   let tx = Binary.decode (LBString.fromStrict $ BString.drop 8 input) :: Tx
                                   if verifyTx tx txstate1
                                      then do modifyMVar_ ref (\s -> return (applyTx tx s))
-                                             putStrLn $ "RECEIVED: " ++ txHash tx
+                                             putStrLn $ "1 " ++ txHash tx
                                      else sends c $ "0"
 
                               _                               -> do
@@ -307,22 +307,30 @@ runNode env txstate = do
     ref <- newMVar txstate
 
     -- Start syncing
-    putStrLn "=====> Syncing with nearby nodes... <====="
+    putStrLn "[P] Syncing with nearby nodes..."
     forkIO (syncNode syncStatus ref (nodeId env) (initSyncEnv env))
-    putStrLn "=====> Finished syncing! <====="
 
     -- Wait for syncing thread to complete
     takeMVar syncStatus
+    putStrLn "[C] Done syncing :-)"
+
+    -- If there is another file remove it with the same
+    -- socket, remove it
+    removeFile (getSocketFilePath env) `catch` (const $ return () :: IOException -> IO ())
 
     -- Run daemon
     forkIO (runServer ref env)
-    putStrLn "=====> Daemon started <====="
+    putStrLn "[C] Daemon started :-)"
 
     -- Mitigate the race condition of making the socket file
     -- sleep for 500 milliseconds
     threadDelay 500000
 
     -- Run CLI Interface
+    putStrLn "=====> Quickstart <====="
+    putStrLn ">> SUBMIT [priv key] [pub addr] [amount]"
+    putStrLn ">> BALANCE [pub addr]"
+    putStrLn ">> QUERY [txid]"
     runClient env
 
 
