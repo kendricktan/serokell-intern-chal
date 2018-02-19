@@ -19,7 +19,8 @@ import           Numeric.Natural             (Natural)
 import           Serokell.Communication.IPC  (Conversation (..), NodeId (..),
                                               connectToUnixSocket,
                                               listenUnixSocket)
-import           System.Directory            (doesFileExist, removeFile)
+import           System.Directory            (createDirectory, doesFileExist,
+                                              removeFile)
 import           System.IO                   (hPrint, hPutStrLn, stderr)
 
 import qualified Control.Concurrent.MVar     as MV
@@ -316,6 +317,7 @@ runNode env txstate = do
 
     -- If there is another file remove it with the same
     -- socket, remove it
+    createDirectory (nodeSocketFolder env) `catch` (const $ return () :: IOException -> IO ())
     removeFile (getSocketFilePath env) `catch` (const $ return () :: IOException -> IO ())
 
     -- Run daemon
