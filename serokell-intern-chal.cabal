@@ -37,12 +37,14 @@ library
     , bytestring
     , containers
     , cryptohash
+    , directory
     , ed25519
     , filepath
     , hashmap
     , mtl
     , network
     , safe-exceptions
+    , system-fileio
     , text
     , transformers
     , utf8-string

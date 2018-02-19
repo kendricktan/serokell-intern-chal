@@ -6,11 +6,12 @@ module Serokell.Node where
 
 import           Control.Concurrent          (MVar, forkIO, killThread,
                                               modifyMVar, modifyMVar_,
-                                              newEmptyMVar, newMVar, readMVar,
-                                              threadDelay, tryPutMVar)
+                                              newEmptyMVar, newMVar, putMVar,
+                                              readMVar, takeMVar, threadDelay,
+                                              tryPutMVar)
 import           Control.Concurrent.Async    (mapConcurrently)
 import           Control.Exception.Base      (IOException, catch, try)
-import           Control.Monad               (void, forever)
+import           Control.Monad               (forever, void)
 import           Control.Monad.Trans         (lift, liftIO)
 import           Data.Semigroup              ((<>))
 import           GHC.Generics                (Generic)
@@ -18,6 +19,7 @@ import           Numeric.Natural             (Natural)
 import           Serokell.Communication.IPC  (Conversation (..), NodeId (..),
                                               connectToUnixSocket,
                                               listenUnixSocket)
+import           System.Directory            (doesFileExist)
 import           System.IO                   (hPrint, hPutStrLn, stderr)
 
 import qualified Control.Concurrent.MVar     as MV
@@ -165,36 +167,51 @@ memberTx :: Hash -> TxState -> Maybe Tx
 memberTx h txstate0 = HM.lookup h (txshm txstate0)
 
 broadcastTx :: Tx -> NodeEnvironment -> IO ()
-broadcastTx tx env = void $ mapConcurrently (broadcastSocket cmd (nodeSocketFolder env)) (filter (curNode /=) [0..maxNode])
+broadcastTx tx env = void $ mapConcurrently (broadcastSocket env cmd) (filter (curNode /=) [0..maxNode])
     where maxNode = nodeCount env
           curNode = unNodeId $ nodeId env
           txbinary = Binary.encode tx
           cmd = LC8.pack "RECEIVE " <> txbinary
 
-broadcastSocket :: LBString.ByteString -> String -> Int -> IO ()
-broadcastSocket bs f i = connectToUnixSocket f (NodeId i) bHandler
+broadcastSocket :: NodeEnvironment -> LBString.ByteString -> Int -> IO ()
+broadcastSocket env bs i =
+    doesFileExist (getSocketFilePath_ env i) >>= (\x ->
+        case x of
+          True  -> connectToUnixSocket (nodeSocketFolder env) (NodeId i) bHandler
+          False -> return ()
+    )
     where bHandler :: Conversation -> IO ()
           bHandler c = void $ send c $ LBString.toStrict bs
 
-newNodeEnv :: NodeEnvironment -> NodeEnvironment
-newNodeEnv (NodeEnvironment i f c d s r) = NodeEnvironment nid f c d s r
-    where nid = NodeId $ head $ filter ((unNodeId i) /=) [0..c]
+getSocketFilePath :: NodeEnvironment -> String
+getSocketFilePath env = (nodeSocketFolder env) ++ "/" ++ ((show . unNodeId . nodeId) env) ++ ".sock"
+
+getSocketFilePath_ :: NodeEnvironment -> Int -> String
+getSocketFilePath_ env i = (nodeSocketFolder env) ++ "/" ++ (show i) ++ ".sock"
+
+newPeer :: NodeEnvironment -> NodeId -> Maybe NodeEnvironment
+newPeer (NodeEnvironment (NodeId i) f c d s r) (NodeId did) = case fid of
+                                          []      -> Nothing
+                                          (x : _) -> Just $ NodeEnvironment (NodeId x) f c d s r
+    where fid = filter (\a -> a > i && did /= a) [0..c]
+
+initSyncEnv (NodeEnvironment (NodeId i) f c d s r) = NodeEnvironment (NodeId i') f c d s r
+    where i' = if i == 0 then 1 else 0
 
 ---- Node controller
 ---------------------------------
 
 runClient :: NodeEnvironment -> IO ()
-runClient env = connectToUnixSocket (nodeSocketFolder env) (nodeId env) clientHandler
+runClient env = forever $ connectToUnixSocket (nodeSocketFolder env) (nodeId env) clientHandler
 
 clientHandler :: Conversation -> IO ()
 clientHandler c = loop
     where loop :: IO ()
           loop = do
             input <- TextIO.getLine
-            void . forkIO $ do send c $ LBString.toStrict $ LC8.pack $ Text.unpack input
-                               resp <- recv c
-                               putStrLn $ C8.unpack resp
-            loop
+            send c $ LBString.toStrict $ LC8.pack $ Text.unpack input
+            resp <- recv c
+            putStrLn $ C8.unpack resp
 
 sends c s = send c $ LBString.toStrict $ LC8.pack s
 
@@ -240,52 +257,77 @@ runServer ref env =
                                   let tx = Binary.decode (LBString.fromStrict $ C8.pack txbinary) :: Tx
                                   if verifyTx tx txstate1
                                      then do modifyMVar_ ref (\s -> return (applyTx tx s))
-                                             void (try $ sends c $ "1 " ++ txHash tx :: IO (Either IOException ()))
+                                             putStrLn $ "1 " ++ txHash tx
                                      else sends c $ "0"
 
                               _                               -> do
                                   sends c $ C8.unpack $ "Invalid command: " <> input
 
--- Syncs disconnected node
-syncNode :: MTxState -> NodeEnvironment -> IO ()
-syncNode ref env = connectToUnixSocket (nodeSocketFolder env) (nodeId env) (syncHandler ref)
+-- Syncs nodes
+syncNode :: MVar () -> MTxState -> NodeId -> NodeEnvironment -> IO ()
+syncNode refSync refState did env =
+    doesFileExist (getSocketFilePath env) >>= (\x ->
+        case x of
+          True  -> connectToUnixSocket (nodeSocketFolder env) (nodeId env) (syncHandler refState)
+          False -> case nodeCount env == (unNodeId $ nodeId env) of
+                        True -> do putMVar refSync ()
+                                   threadDelay (resyncTimeout env)
+                        False -> case newPeer env did of
+                                   Just e -> syncNode refSync refState did e
+                                   Nothing -> do putMVar refSync ()
+                                                 threadDelay (resyncTimeout env)
+    )
     where syncHandler :: MTxState -> Conversation -> IO ()
-          syncHandler ref c = loop
+          syncHandler refState c = loop
               where loop :: IO ()
                     loop = do
-                        txstate0 <- readMVar ref
+                        txstate0 <- readMVar refState
 
-                        sends c "LATESTTX"
-                        (h :: Int) <- Binary.decode . LBString.fromStrict <$> recv c
+                        sends c $ "GETTX " ++ (show . (+1) . getTxLength) txstate0
+                        resp <- recv c
 
-                        -- Have we finished syncing?
-                        case h <= getTxLength txstate0 of
-                          True  -> return ()
-                          False -> do
-                              sends c $ "GETTX " ++ (show . (+1) . getTxLength) txstate0
-                              tx :: Tx <- Binary.decode . LBString.fromStrict <$> recv c
+                        case String.words $ C8.unpack resp of
+                          ["0"] -> do putMVar refSync ()
+                                      threadDelay (resyncTimeout env)
+                          _  -> do
+                              let tx = Binary.decode (LBString.fromStrict resp) :: Tx
                               if verifyTx tx txstate0
-                                 then do modifyMVar_ ref (\s -> return $ applyTx tx s)
-                                         loop
-                                 else syncNode ref (newNodeEnv env) -- Adversarial? Disconnect and connect to another node
-
+                                 then do modifyMVar_ refState (\s -> return $ applyTx tx s)
+                                         putStrLn $ "SYCNED: " ++ txHash tx
+                                 else case newPeer env did of
+                                        Just e -> syncNode refSync refState did e
+                                        Nothing -> do putMVar refSync () -- Reached end of our nodes
+                                                      threadDelay (resyncTimeout env)
+                        syncNode refSync refState did env
 
 runNode :: NodeEnvironment -> TxState -> IO ()
 runNode env txstate = do
+    -- References
+    syncStatus <- newEmptyMVar
     ref <- newMVar txstate
 
-    -- catch (syncNode ref env) (\_ -> putStrLn "No nodes found, syncing skipped!")
-    threadId <- forkIO (runServer ref env)
+    -- Start syncing
+    putStrLn "=====> Syncing with nearby nodes... <====="
+    forkIO (syncNode syncStatus ref (nodeId env) (initSyncEnv env))
+    putStrLn "=====> Finished syncing! <====="
+
+    -- Wait for syncing thread to complete
+    takeMVar syncStatus
+
+    -- Run daemon
+    forkIO (runServer ref env)
+    putStrLn "=====> Daemon started <====="
+
     -- Mitigate the race condition of making the socket file
     -- sleep for 500 milliseconds
     threadDelay 500000
+
+    -- Run CLI Interface
     runClient env
 
 
 ---- Testing
 ---------------
-
-
 initialEnv = NodeEnvironment (NodeId 0) "sockets" 1 0 0 0
 
 initialEnv2 = NodeEnvironment (NodeId 1) "sockets" 1 0 0 0
