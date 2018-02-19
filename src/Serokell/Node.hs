@@ -4,13 +4,14 @@
 
 module Serokell.Node where
 
-import           Control.Concurrent          (forkIO, killThread, threadDelay)
+import           Control.Concurrent          (MVar, forkIO, killThread,
+                                              modifyMVar, modifyMVar_,
+                                              newEmptyMVar, newMVar, readMVar,
+                                              threadDelay, tryPutMVar)
 import           Control.Concurrent.Async    (mapConcurrently)
-import           Control.Exception.Base      (catch, try, IOException)
-import           Control.Monad               (void)
+import           Control.Exception.Base      (IOException, catch, try)
+import           Control.Monad               (void, forever)
 import           Control.Monad.Trans         (lift, liftIO)
-import           Data.IORef                  (IORef, modifyIORef, newIORef,
-                                              readIORef)
 import           Data.Semigroup              ((<>))
 import           GHC.Generics                (Generic)
 import           Numeric.Natural             (Natural)
@@ -40,6 +41,7 @@ import qualified Data.Text.IO                as TextIO
 
 type Hash    = String
 type Address = String
+type MTxState = MVar TxState
 
 data Tx = Tx { txHash     :: Hash     -- Hash of the tx
              , txPrevHash :: Hash -- Hash of previous tx
@@ -48,10 +50,6 @@ data Tx = Tx { txHash     :: Hash     -- Hash of the tx
              , txTo       :: Address  -- Who is receiving it
              , txAmount   :: Natural  -- How much
              } deriving (Eq, Ord, Generic, Show)
-
--- Error Handling
-data TxError = TxSubmitError
-             | TxQueryError deriving Show
 
 -- Node Environment, Immutable
 data NodeEnvironment = NodeEnvironment
@@ -200,24 +198,24 @@ clientHandler c = loop
 
 sends c s = send c $ LBString.toStrict $ LC8.pack s
 
-runServer :: IORef TxState -> NodeEnvironment -> IO ()
+runServer :: MTxState -> NodeEnvironment -> IO ()
 runServer ref env =
-    listenUnixSocket (nodeSocketFolder env) (nodeId env) ((True <$) . forkIO . serverHandler ref)
+    forever $ listenUnixSocket (nodeSocketFolder env) (nodeId env) ((True <$) . forkIO . serverHandler ref)
         where
-            serverHandler :: IORef TxState -> Conversation -> IO ()
+            serverHandler :: MTxState -> Conversation -> IO ()
             serverHandler ref c = loop
                     where
                         loop :: IO ()
                         loop = do
                             input <- recv c
-                            txstate1 <- readIORef ref
+                            txstate1 <- readMVar ref
 
                             case String.words $ C8.unpack input of
                               ("SUBMIT" : sk : pk : amnt : _) -> do
                                   let tx = createTx sk pk amnt txstate1
                                   if verifyTx tx txstate1
                                      then do
-                                         modifyIORef ref (applyTx tx)
+                                         modifyMVar_ ref (\s -> return (applyTx tx s))
                                          broadcastTx tx env
                                          sends c $ "1 " ++ txHash tx
                                      else hPutStrLn stderr "0"
@@ -241,23 +239,21 @@ runServer ref env =
                               ("RECEIVE" : txbinary : _)         -> do
                                   let tx = Binary.decode (LBString.fromStrict $ C8.pack txbinary) :: Tx
                                   if verifyTx tx txstate1
-                                     then do modifyIORef ref (applyTx tx)
+                                     then do modifyMVar_ ref (\s -> return (applyTx tx s))
                                              void (try $ sends c $ "1 " ++ txHash tx :: IO (Either IOException ()))
                                      else sends c $ "0"
 
                               _                               -> do
                                   sends c $ C8.unpack $ "Invalid command: " <> input
 
-                            loop
-
 -- Syncs disconnected node
-syncNode :: IORef TxState -> NodeEnvironment -> IO ()
+syncNode :: MTxState -> NodeEnvironment -> IO ()
 syncNode ref env = connectToUnixSocket (nodeSocketFolder env) (nodeId env) (syncHandler ref)
-    where syncHandler :: IORef TxState -> Conversation -> IO ()
+    where syncHandler :: MTxState -> Conversation -> IO ()
           syncHandler ref c = loop
               where loop :: IO ()
                     loop = do
-                        txstate0 <- readIORef ref
+                        txstate0 <- readMVar ref
 
                         sends c "LATESTTX"
                         (h :: Int) <- Binary.decode . LBString.fromStrict <$> recv c
@@ -269,14 +265,14 @@ syncNode ref env = connectToUnixSocket (nodeSocketFolder env) (nodeId env) (sync
                               sends c $ "GETTX " ++ (show . (+1) . getTxLength) txstate0
                               tx :: Tx <- Binary.decode . LBString.fromStrict <$> recv c
                               if verifyTx tx txstate0
-                                 then do modifyIORef ref (applyTx tx)
+                                 then do modifyMVar_ ref (\s -> return $ applyTx tx s)
                                          loop
                                  else syncNode ref (newNodeEnv env) -- Adversarial? Disconnect and connect to another node
 
 
 runNode :: NodeEnvironment -> TxState -> IO ()
 runNode env txstate = do
-    ref <- newIORef txstate
+    ref <- newMVar txstate
 
     -- catch (syncNode ref env) (\_ -> putStrLn "No nodes found, syncing skipped!")
     threadId <- forkIO (runServer ref env)
