@@ -51,6 +51,8 @@ library
   exposed-modules:
       Serokell.Communication.IPC
       Serokell.Node
+      Serokell.Types
+      Serokell.Helpers
   other-modules:
       Paths_serokell_intern_chal
   default-language: Haskell2010
