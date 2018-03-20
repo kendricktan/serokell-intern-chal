@@ -202,17 +202,25 @@ initSyncEnv (NodeEnvironment (NodeId i) f c d s r) = NodeEnvironment (NodeId i')
 ---- Node controller
 ---------------------------------
 
-runClient :: NodeEnvironment -> IO ()
-runClient env = forever $ connectToUnixSocket (nodeSocketFolder env) (nodeId env) clientHandler
+runClient :: MTxState -> NodeEnvironment -> IO ()
+runClient ref env = forever $ connectToUnixSocket (nodeSocketFolder env) (nodeId env) (clientHandler ref)
 
-clientHandler :: Conversation -> IO ()
-clientHandler c = loop
+clientHandler :: MTxState -> Conversation -> IO ()
+clientHandler ref c = loop
     where loop :: IO ()
           loop = do
             input <- TextIO.getLine
-            case length (Text.unpack input) of
-              0 -> send c $ LBString.toStrict $ LC8.pack " "
-              _ -> send c $ LBString.toStrict $ LC8.pack $ Text.unpack input
+            txstate1 <- readMVar ref
+            case String.words $ Text.unpack input of
+              -- SUBMIT handles signing
+              -- Don't wanna send the pk over sockets
+              ("SUBMIT" : sk : pk : amnt : _) -> do
+                  let tx = createTx sk pk amnt txstate1
+                  let txbinary = Binary.encode tx
+                  send c $ LBString.toStrict $ LC8.pack "SUBMITSIGNED " <> txbinary
+              -- Every other case just pust it to the server
+              (_ : _)       -> send c $ LBString.toStrict $ LC8.pack $ Text.unpack input
+              []            -> send c $ LBString.toStrict $ LC8.pack " "
             resp <- recv c
             putStrLn $ C8.unpack resp
 
@@ -231,15 +239,14 @@ runServer ref env =
                             txstate1 <- readMVar ref
 
                             case String.words $ C8.unpack input of
-                              ("SUBMIT" : sk : pk : amnt : _) -> do
-                                  let tx = createTx sk pk amnt txstate1
+                              ("SUBMITSIGNED" : _)             -> do
+                                  let tx = Binary.decode (LBString.fromStrict $ BString.drop 13 input) :: Tx
                                   if verifyTx tx txstate1
                                      then do
                                          modifyMVar_ ref (\s -> return (applyTx tx s))
                                          broadcastTx tx env
                                          sends c $ "1 " ++ txHash tx
                                      else hPutStrLn stderr "0"
-
                               ("QUERY" : txid : _)             -> do
                                   case memberTx txid txstate1 of
                                     Just x  -> sends c $ "1 " <> txHash x
@@ -335,7 +342,7 @@ runNode env txstate = do
     putStrLn ">> SUBMIT [priv key] [pub addr] [amount]"
     putStrLn ">> BALANCE [pub addr]"
     putStrLn ">> QUERY [txid]"
-    runClient env
+    runClient ref env
 
 
 ---- Testing
