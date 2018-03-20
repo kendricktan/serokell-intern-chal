@@ -46,7 +46,7 @@ clientHandler ref c = loop
               ("SUBMIT" : sk : pk : amnt : _) -> do
                   let tx = createTx sk pk amnt txstate1
                   let txbinary = Binary.encode tx
-                  send c $ LBString.toStrict $ LC8.pack "SUBMITSIGNED " <> txbinary
+                  send c $ LBString.toStrict $ LC8.pack "SUBMIT " <> txbinary
               -- Every other case just pust it to the server
               (_ : _)       -> send c $ LBString.toStrict $ LC8.pack $ Text.unpack input
               []            -> send c $ LBString.toStrict $ LC8.pack " "
@@ -68,8 +68,8 @@ runServer ref env =
                             txstate1 <- readMVar ref
 
                             case String.words $ C8.unpack input of
-                              ("SUBMITSIGNED" : _)             -> do
-                                  let tx = Binary.decode (LBString.fromStrict $ BString.drop 13 input) :: Tx
+                              ("SUBMIT" : _)             -> do
+                                  let tx = Binary.decode (LBString.fromStrict $ BString.drop 7 input) :: Tx
                                   if verifyTx tx txstate1
                                      then do
                                          modifyMVar_ ref (return . applyTx tx)
