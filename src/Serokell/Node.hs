@@ -210,7 +210,9 @@ clientHandler c = loop
     where loop :: IO ()
           loop = do
             input <- TextIO.getLine
-            send c $ LBString.toStrict $ LC8.pack $ Text.unpack input
+            case length (Text.unpack input) of
+              0 -> send c $ LBString.toStrict $ LC8.pack " "
+              _ -> send c $ LBString.toStrict $ LC8.pack $ Text.unpack input
             resp <- recv c
             putStrLn $ C8.unpack resp
 
