@@ -3,6 +3,7 @@ module Main where
 import           Numeric.Natural
 import           Serokell.Communication.IPC
 import           Serokell.Node
+import           Serokell.Types
 import           System.Environment
 
 import qualified Data.HashMap               as HM
